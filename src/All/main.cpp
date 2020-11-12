@@ -2,7 +2,7 @@
   ShashChess, a UCI chess playing engine derived from Stockfish
   Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
   Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
-  Copyright (C) 2015-2018 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
+  Copyright (C) 2015-2019 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
 
   ShashChess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -21,6 +21,8 @@
 #include <iostream>
 
 #include "bitboard.h"
+#include "endgame.h"
+#include "misc.h"
 #include "position.h"
 #include "search.h"
 #include "thread.h"
@@ -36,14 +38,26 @@ int main(int argc, char* argv[]) {
 
   std::cout << engine_info() << std::endl;
 
+  CommandLine::init(argc, argv);
+  Utility::init(argv[0]); //Khalid
   UCI::init(Options);
+  Tune::init();
+  //from Kelly begin
+  if(!(Options["Persisted learning"]== "Off"))
+  {
+  	Utility::init(argv[0]); //Khalid
+	initLearning ();//Kelly
+  }
+  //from Kelly end
   PSQT::init();
   Bitboards::init();
   Position::init();
   Bitbases::init();
-  Search::init();
-  Threads.set(Options["Threads"]);
+  Endgames::init();
+  Threads.set(size_t(Options["Threads"]));
+  Threads.setFull(Options["Full depth threads"]);//Full threads patch
   Search::clear(); // After threads are up
+  Eval::NNUE::init();
 
   UCI::loop(argc, argv);
 

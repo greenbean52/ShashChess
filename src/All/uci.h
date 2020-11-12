@@ -2,7 +2,7 @@
   ShashChess, a UCI chess playing engine derived from Stockfish
   Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
   Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
-  Copyright (C) 2015-2018 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
+  Copyright (C) 2015-2019 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
 
   ShashChess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -73,16 +73,17 @@ std::string value(Value v);
 std::string square(Square s);
 std::string move(Move m, bool chess960);
 std::string pv(const Position& pos, Depth depth, Value alpha, Value beta);
+std::string wdl(Value v, int ply);
 Move to_move(const Position& pos, std::string& str);
 
 } // namespace UCI
 
 extern UCI::OptionsMap Options;
-//from Shashin
+//no uci options, but constants
 enum {
 	NODES_TIME = 0,
-	MIN_THINK_TIME = 20,
 	SYZ_50_MOVE = 1
 };
-//end from Shashin
+//end no uci options, but constants
+
 #endif // #ifndef UCI_H_INCLUDED

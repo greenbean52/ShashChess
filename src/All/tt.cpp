@@ -2,7 +2,7 @@
   ShashChess, a UCI chess playing engine derived from Stockfish
   Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
   Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
-  Copyright (C) 2015-2018 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
+  Copyright (C) 2015-2019 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
 
   ShashChess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -20,45 +20,47 @@
 
 #include <cstring>   // For std::memset
 #include <iostream>
+#include <iomanip>
 #include <thread>
-#include <fstream> //from kellykynyama mcts
+#include <algorithm>
+#include <fstream> //from kellykynyama
 #include "bitboard.h"
 #include "misc.h"
 #include "thread.h"
 #include "tt.h"
 #include "uci.h"
 
-//from kellykynyama begin
+//from Kelly Begin
+#define SHOW_EXP_STATS  0
+PersistedLearningUsage usePersistedLearning;
 using namespace std;
-
-TranspositionTable EXP; // Our global transposition table
-
-MCTSHashTable MCTS;
-//from kellykynyama end
+LearningHashTable globalLearningHT;
+//from Kelly end
 
 TranspositionTable TT; // Our global transposition table
 
-/// TTEntry::save populates the TTEntry with a new node's data, possibly
+/// TTEntry::save() populates the TTEntry with a new node's data, possibly
 /// overwriting an old position. Update is not atomic and can be racy.
 
 void TTEntry::save(Key k, Value v, bool pv, Bound b, Depth d, Move m, Value ev) {
 
-  assert(d / ONE_PLY * ONE_PLY == d);
-
   // Preserve any existing move for the same position
-  if (m || (k >> 48) != key16)
+  if (m || (uint16_t)k != key16)
       move16 = (uint16_t)m;
 
-  // Overwrite less valuable entries
-  if (  (k >> 48) != key16
-      || d / ONE_PLY > depth8 - 4
-      || b == BOUND_EXACT)
+  // Overwrite less valuable entries (cheapest checks first)
+  if (b == BOUND_EXACT
+      || (uint16_t)k != key16
+      || d - DEPTH_OFFSET > depth8 - 4)
   {
-      key16     = (uint16_t)(k >> 48);
+      assert(d > DEPTH_OFFSET);
+      assert(d < 256 + DEPTH_OFFSET);
+
+      key16     = (uint16_t)k;
+      depth8    = (uint8_t)(d - DEPTH_OFFSET);
+      genBound8 = (uint8_t)(TT.generation8 | uint8_t(pv) << 2 | b);
       value16   = (int16_t)v;
       eval16    = (int16_t)ev;
-      genBound8 = (uint8_t)(TT.generation8 | uint8_t(pv) << 2 | b);
-      depth8    = (int8_t)(d / ONE_PLY);
   }
 }
 
@@ -71,19 +73,18 @@ void TranspositionTable::resize(size_t mbSize) {
 
   Threads.main()->wait_for_search_finished();
 
+  aligned_large_pages_free(table);
+
   clusterCount = mbSize * 1024 * 1024 / sizeof(Cluster);
 
-  free(mem);
-  mem = malloc(clusterCount * sizeof(Cluster) + CacheLineSize - 1);
-
-  if (!mem)
+  table = static_cast<Cluster*>(aligned_large_pages_alloc(clusterCount * sizeof(Cluster)));
+  if (!table)
   {
       std::cerr << "Failed to allocate " << mbSize
                 << "MB for transposition table." << std::endl;
       exit(EXIT_FAILURE);
   }
 
-  table = (Cluster*)((uintptr_t(mem) + CacheLineSize - 1) & ~(CacheLineSize - 1));
   clear();
 }
 
@@ -104,8 +105,8 @@ void TranspositionTable::clear() {
               WinProcGroup::bindThisThread(idx);
 
           // Each thread will zero its part of the hash table
-          const size_t stride = clusterCount / Options["Threads"],
-                       start  = stride * idx,
+          const size_t stride = size_t(clusterCount / Options["Threads"]),
+                       start  = size_t(stride * idx),
                        len    = idx != Options["Threads"] - 1 ?
                                 stride : clusterCount - start;
 
@@ -113,7 +114,7 @@ void TranspositionTable::clear() {
       });
   }
 
-  for (std::thread& th: threads)
+  for (std::thread& th : threads)
       th.join();
 }
 
@@ -127,14 +128,14 @@ void TranspositionTable::clear() {
 TTEntry* TranspositionTable::probe(const Key key, bool& found) const {
 
   TTEntry* const tte = first_entry(key);
-  const uint16_t key16 = key >> 48;  // Use the high 16 bits as key inside the cluster
+  const uint16_t key16 = (uint16_t)key;  // Use the low 16 bits as key inside the cluster
 
   for (int i = 0; i < ClusterSize; ++i)
-      if (!tte[i].key16 || tte[i].key16 == key16)
+      if (tte[i].key16 == key16 || !tte[i].depth8)
       {
           tte[i].genBound8 = uint8_t(generation8 | (tte[i].genBound8 & 0x7)); // Refresh
 
-          return found = (bool)tte[i].key16, &tte[i];
+          return found = (bool)tte[i].depth8, &tte[i];
       }
 
   // Find an entry to be replaced according to the replacement strategy
@@ -158,223 +159,349 @@ TTEntry* TranspositionTable::probe(const Key key, bool& found) const {
 int TranspositionTable::hashfull() const {
 
   int cnt = 0;
-  for (int i = 0; i < 1000 / ClusterSize; ++i)
+  for (int i = 0; i < 1000; ++i)
       for (int j = 0; j < ClusterSize; ++j)
-          cnt += (table[i].entry[j].genBound8 & 0xF8) == generation8;
+          cnt += table[i].entry[j].depth8 && (table[i].entry[j].genBound8 & 0xF8) == generation8;
 
-  return cnt * 1000 / (ClusterSize * (1000 / ClusterSize));
+  return cnt / ClusterSize;
 }
+//from Kelly begin
+bool pauseExperience = false;
 
-//kellyKinyama mcts begin
-void EXPresize() {
+#if defined(SHOW_EXP_STATS) && SHOW_EXP_STATS == 1
+static size_t fileEntries = 0;
+static size_t countOfNodeInfo = 0;
+static size_t countOfMoveInfo = 0;
+static size_t duplicateMoves = 0;
+static size_t sizeInMemory = sizeof(globalLearningHT);
+#endif
 
-	ifstream myFile("experience.bin", ios::in | ios::binary);
-
-
-	int load = 1;
-	while (load)
-	{
-		ExpEntry tempExpEntry;
-		tempExpEntry.depth = Depth(0);
-		tempExpEntry.hashkey = 0;
-		tempExpEntry.move = Move(0);
-		tempExpEntry.score = Value(0);
-
-		myFile.read((char*)&tempExpEntry, sizeof(tempExpEntry));
-
-		if (tempExpEntry.hashkey)
-		{
-
-			mctsInsert(tempExpEntry);
-		}
-		else
-			load = 0;
-
-
-
-		if (!tempExpEntry.hashkey)
-			load = 0;
-	}
-	myFile.close();
-
-}
-void EXPawnresize() {
-
-	ifstream myFile("pawngame.bin", ios::in | ios::binary);
-
-
-	int load = 1;
-	while (load)
-	{
-		ExpEntry tempExpEntry;
-		tempExpEntry.depth = Depth(0);
-		tempExpEntry.hashkey = 0;
-		tempExpEntry.move = Move(0);
-		tempExpEntry.score = Value(0);
-
-		myFile.read((char*)&tempExpEntry, sizeof(tempExpEntry));
-
-		if (tempExpEntry.hashkey)
-		{
-			mctsInsert(tempExpEntry);
-		}
-		else
-			load = 0;
-
-
-		if (!tempExpEntry.hashkey)
-			load = 0;
-	}
-	myFile.close();
-
-}
-void EXPload(char* fen)
+bool loadExperienceFile(const string& filename, bool deleteAfterLoading)
 {
+    std::string fn = Utility::map_path(filename);
+    ifstream inputLearningFile(fn, ios::in | ios::binary);
 
-	ifstream myFile(fen, ios::in | ios::binary);
+    //Quick exit if file is not present
+    if (!inputLearningFile.is_open())
+        return false;
 
+    LearningFileEntry tempEntry;
+    while (true)
+    {
+        //Invalidate the entry
+        tempEntry.hashKey = (Key)0;
 
+        //Read a new entry
+        inputLearningFile.read((char*)&tempEntry, sizeof(tempEntry));
 
+        //If we got a null hashKey it means we are done!
+        if (!tempEntry.hashKey)
+            break;
 
-	int load = 1;
+        insertIntoOrUpdateLearningTable(tempEntry);
+    }
 
-	while (load)
-	{
-		ExpEntry tempExpEntry;
-		tempExpEntry.depth = Depth(0);
-		tempExpEntry.hashkey = 0;
-		tempExpEntry.move = Move(0);
-		tempExpEntry.score = Value(0);
-		myFile.read((char*)&tempExpEntry, sizeof(tempExpEntry));
+    //Close it
+    inputLearningFile.close();
 
-		if (tempExpEntry.hashkey)
-		{
-			mctsInsert(tempExpEntry);
-		}
-		load = 0;
+    //Delete it if requested
+    if (deleteAfterLoading)
+        remove(fn.c_str());
 
-
-		if (!tempExpEntry.hashkey)
-			load = 0;
-	}
-	myFile.close();
+    return true;
 }
 
-void mctsInsert(ExpEntry tempExpEntry)
+bool loadSlaveLearningFilesIntoLearningTables()
 {
-	// If the node already exists in the hash table, we want to return it.
-	// We search in the range of all the hash table entries with key "key1".
-	auto range = MCTS.equal_range(tempExpEntry.hashkey);
-	auto it1 = range.first;
-	auto it2 = range.second;
+    int i = 0;
+    while (true)
+    {
+        if (!loadExperienceFile("experience" + std::to_string(i) + ".bin", true))
+            break;
 
-	bool newNode = true;
-	while (it1 != it2)
-	{
-		Node node = &(it1->second);
+        i++;
+    }
 
-		if (node->hashkey == tempExpEntry.hashkey)
-		{
-			bool newChild = true;
-			newNode = false;
-			for (int x = 0; x < node->sons; x++)
-			{
-				if (node->child[x].move == tempExpEntry.move)
-				{
-					newChild = false;
-					node->child[x].move = tempExpEntry.move;
-					node->child[x].depth = tempExpEntry.depth;
-					node->child[x].score = tempExpEntry.score;
-					node->child[x].visits++;
-					//	node->sons++;
-					node->totalVisits++;
-					break;
-				}
-			}
-			if (newChild && node->sons < MAX_CHILDREN)
-			{
-				node->child[node->sons].move = tempExpEntry.move;
-				node->child[node->sons].depth = tempExpEntry.depth;
-				node->child[node->sons].score = tempExpEntry.score;
-				node->child[node->sons].visits++;
-				node->sons++;
-				node->totalVisits++;
-			}
-
-
-
-		}
-
-		it1++;
-	}
-
-	if (newNode)
-	{
-		// Node was not found, so we have to create a new one
-		NodeInfo infos;
-
-		infos.hashkey = 0;        // Zobrist hash of pawns
-		infos.sons = 0;
-
-		infos.totalVisits = 0;// number of visits by the Monte-Carlo algorithm
-		infos.child[0].move = MOVE_NONE;
-		infos.child[0].depth = DEPTH_NONE;
-		infos.child[0].score = VALUE_NONE;
-		infos.child[0].visits = 0;
-		std::memset(infos.child, 0, sizeof(Child) * 20);
-
-		infos.hashkey = tempExpEntry.hashkey;        // Zobrist hash of pawns
-		infos.sons = 1;       // number of visits by the Monte-Carlo algorithm
-		infos.totalVisits = 1;
-		infos.child[0].move = tempExpEntry.move;
-		infos.child[0].depth = tempExpEntry.depth;
-		infos.child[0].score = tempExpEntry.score;
-		infos.child[0].visits = 1;       // number of sons expanded by the Monte-Carlo algorithm
-										 //infos.lastMove = MOVE_NONE; // the move between the parent and this node
-
-										 //debug << "inserting into the hash table: key = " << key1 << endl;
-
-		MCTS.insert(make_pair(tempExpEntry.hashkey, infos));
-	}
+    return i > 0;
 }
 
-/// get_node() probes the Monte-Carlo hash table to find the node with the given
-/// position, creating a new entry if it doesn't exist yet in the table.
-/// The returned node is always valid.
-Node get_node(Key key) {
+void initLearning()
+{
+    setUsePersistedLearning();
+    loadExperienceFile("experience.bin", false);
 
+    bool shouldRefresh = false;
 
-	// If the node already exists in the hash table, we want to return it.
-	// We search in the range of all the hash table entries with key "key1".
+    //Just in case, check and load for "experience_new.bin" which will be present if
+    //previous saving operation failed (engine crashed or terminated)
+    shouldRefresh |= loadExperienceFile("experience_new.bin", true);
 
-	Node mynode = nullptr;
-	auto range = MCTS.equal_range(key);
-	auto it1 = range.first;
-	auto it2 = range.second;
+    //Load slave experience files (if any)
+    shouldRefresh |= loadSlaveLearningFilesIntoLearningTables();
 
-	if (
-		it1 != MCTS.end()
-		&& 
-		it2 != MCTS.end()
-		)
-	{
+    if (shouldRefresh)
+    {
+        //We need to write all consolidated experience to disk
+        writeLearningFile();
 
-		mynode = &(it1->second);
+        //Clear existing hash tables before we refresh them
+        globalLearningHT.clear();
 
-		while (
-			it1 != it2
-			&&
-			it1 != MCTS.end()
-			)
-		{
-			Node node = &(it1->second);
-			if (node->hashkey == key)
-				return node;
+#if defined(SHOW_EXP_STATS) && SHOW_EXP_STATS == 1
+        //Start fresh
+        fileEntries = 0;
+        countOfNodeInfo = 0;
+        countOfMoveInfo = 0;
+        duplicateMoves = 0;
+        sizeInMemory = sizeof(globalLearningHT);
+#endif
 
-			it1++;
-		}
+        //Refresh
+        loadExperienceFile("experience.bin", false);
+    }
 
-	}
-	return mynode;
+#if defined(SHOW_EXP_STATS) && SHOW_EXP_STATS == 1
+    //Calculate actual data in globalLearningHT
+    size_t nodes = globalLearningHT.size();
+    size_t moves = 0;
+    for (const std::pair<Key, NodeInfo> &it : globalLearningHT)
+        moves += it.second.siblingMoveInfo.size();
+
+    cout << "File entries                                                         : " << fileEntries << endl;
+    cout << "Number of NodeInfo structures                                        : " << countOfNodeInfo << " (Actual count in hash table: " << nodes << ")" << endl;
+    cout << "Number of MoveInfo structures                                        : " << countOfMoveInfo << endl;
+    cout << "Duplicate moves (Moves that exist twice in same file or slave files) : " << duplicateMoves << endl;
+    cout << "Total moves                                                          : " << (duplicateMoves + countOfMoveInfo) << " (Actual count in hash table: " << moves << ")" << endl;
+    cout << "Calculated memory consumption                                        : " << sizeInMemory << " B = "
+                                                                                     << std::setprecision(2) << std::fixed << sizeInMemory / 1024.0 << " KB = "
+                                                                                     << std::setprecision(2) << std::fixed << sizeInMemory / (1024.0 * 1024.0) << " MB = "
+                                                                                     << std::setprecision(2) << std::fixed << sizeInMemory / (1024.0 * 1024.0 * 1000.0) << " GB" << endl;
+#endif
 }
-//kellyKinyama mcts end
+
+void setUsePersistedLearning()
+{
+    if (Options["Persisted learning"] == "Off")
+    {
+        usePersistedLearning = PersistedLearningUsage::Off;
+    }
+    else if (Options["Persisted learning"] == "Standard")
+    {
+        usePersistedLearning = PersistedLearningUsage::Standard;
+    }
+    else //Classical
+    {
+        usePersistedLearning = PersistedLearningUsage::Self;
+    }
+}
+
+void updateLatestMoveInfo(NodeInfo *node, int k)
+{
+    //update lateChild begin
+    node->latestMoveInfo.move = node->siblingMoveInfo[k].move;
+    node->latestMoveInfo.score = node->siblingMoveInfo[k].score;
+    node->latestMoveInfo.depth = node->siblingMoveInfo[k].depth;
+    node->latestMoveInfo.performance = node->siblingMoveInfo[k].performance;
+    //update lateChild end
+}
+
+void setSiblingMoveInfo(NodeInfo *node, int k, LearningFileEntry& fileExpEntry)
+{
+    node->siblingMoveInfo[k].score = fileExpEntry.score;
+    node->siblingMoveInfo[k].depth = fileExpEntry.depth;
+    node->siblingMoveInfo[k].performance = fileExpEntry.performance;
+}
+
+NodeInfo getNewNodeInfo(LearningFileEntry& fileExpEntry)
+{
+    // Node was not found, so we have to create a new one
+    NodeInfo newNodeInfo;
+    newNodeInfo.hashKey = fileExpEntry.hashKey;
+    newNodeInfo.latestMoveInfo.move = fileExpEntry.move;
+    newNodeInfo.latestMoveInfo.score = fileExpEntry.score;
+    newNodeInfo.latestMoveInfo.depth = fileExpEntry.depth;
+    newNodeInfo.latestMoveInfo.performance = fileExpEntry.performance;
+
+    newNodeInfo.siblingMoveInfo.push_back(newNodeInfo.latestMoveInfo);
+    return newNodeInfo;
+}
+
+void insertIntoOrUpdateLearningTable(LearningFileEntry& fileExpEntry)
+{
+#if defined(SHOW_EXP_STATS) && SHOW_EXP_STATS == 1
+    fileEntries++;
+#endif
+
+    // We search in the range of all the hash table entries with key fileExpEntry
+    LearningHashTable::iterator it = globalLearningHT.find(fileExpEntry.hashKey);
+
+    //Quick handling/exit if 'fileExpEntry' is for a new position
+    if (it == globalLearningHT.end())
+    {
+#if defined(SHOW_EXP_STATS) && SHOW_EXP_STATS == 1
+        countOfNodeInfo++;
+        countOfMoveInfo++;
+        sizeInMemory += sizeof(NodeInfo) + sizeof(MoveInfo) + sizeof(std::pair<Key, NodeInfo>);
+#endif
+
+        //Insert new node
+        globalLearningHT.insert(std::make_pair(fileExpEntry.hashKey, getNewNodeInfo(fileExpEntry)));
+
+        //Nothing else to do
+        return;
+    }
+
+    NodeInfo *node = &(it->second);
+
+    //Check if this move already exists
+    std::vector<MoveInfo>::iterator existingMoveIterator = std::find_if(
+        node->siblingMoveInfo.begin(),
+        node->siblingMoveInfo.end(),
+        [&fileExpEntry](const MoveInfo &mi) {return mi.move == fileExpEntry.move; });
+
+    //If move does not exist then insert it
+    size_t k; //This will be used as index
+    if (existingMoveIterator == node->siblingMoveInfo.end())
+    {
+#if defined(SHOW_EXP_STATS) && SHOW_EXP_STATS == 1
+        countOfMoveInfo++;
+        sizeInMemory += sizeof(MoveInfo);
+#endif
+        
+        node->siblingMoveInfo.push_back(MoveInfo()); //Insert a new MoveInfo structure
+
+        //Update the newly inserted MoveInfo
+        k = node->siblingMoveInfo.size() - 1;
+        setSiblingMoveInfo(node, k, fileExpEntry);
+        node->siblingMoveInfo[k].move = fileExpEntry.move;
+
+        if (
+            ((node->siblingMoveInfo[k].score > node->latestMoveInfo.score
+                || node->latestMoveInfo.move == node->siblingMoveInfo[k].move)
+                && (usePersistedLearning == PersistedLearningUsage::Self)
+                )
+            ||
+            (
+                ((node->latestMoveInfo.depth < node->siblingMoveInfo[k].depth)
+                    ||
+                    ((node->latestMoveInfo.depth == node->siblingMoveInfo[k].depth) && (node->latestMoveInfo.score <= node->siblingMoveInfo[k].score)))
+                && (usePersistedLearning != PersistedLearningUsage::Self)
+                )
+            )
+        {
+            updateLatestMoveInfo(node, k);
+        }
+
+        //Nothing else to do
+        return;
+    }
+
+    //Since we are here it means the move is duplicate (already exists)
+    //This also means that we have the NodeInfo structure in the map, as well as the MoveInfo in the vector
+#if defined(SHOW_EXP_STATS) && SHOW_EXP_STATS == 1
+    duplicateMoves++;
+    assert(existingMoveIterator->move == fileExpEntry.move); //Just to double check
+#endif
+
+    k = std::distance(node->siblingMoveInfo.begin(), existingMoveIterator);
+
+    if (usePersistedLearning == PersistedLearningUsage::Self)
+    {
+        setSiblingMoveInfo(node, k, fileExpEntry);
+        if (node->siblingMoveInfo[k].score > node->latestMoveInfo.score
+            || node->latestMoveInfo.move == node->siblingMoveInfo[k].move)
+        {
+            updateLatestMoveInfo(node, k);
+        }
+    }
+    else
+    {
+        if (
+            ((((node->siblingMoveInfo[k].depth < fileExpEntry.depth))
+                ||
+                ((node->siblingMoveInfo[k].depth == fileExpEntry.depth) &&
+                    ((node->siblingMoveInfo[k].score < fileExpEntry.score)))))
+            )
+        {
+            setSiblingMoveInfo(node, k, fileExpEntry);
+            if ((node->latestMoveInfo.depth < node->siblingMoveInfo[k].depth)
+                ||
+                ((node->latestMoveInfo.depth == node->siblingMoveInfo[k].depth) && (node->latestMoveInfo.score <= node->siblingMoveInfo[k].score)))
+            {
+                updateLatestMoveInfo(node, k);
+            }
+        }
+    }
+}
+
+/// getNodeFromGlobalHT(Key key) probes the Monte-Carlo hash table to return the node with the given
+/// position or a nullptr Node if it doesn't exist yet in the table.
+NodeInfo *getNodeFromHT(Key key)
+{
+    LearningHashTable::iterator it = globalLearningHT.find(key);
+    if (it == globalLearningHT.end())
+        return nullptr;
+
+    return &(it->second);
+}
+Value makeExpValue(LearningFileEntry fileExpEntry)
+{
+    LearningHashTable::iterator it = globalLearningHT.find(fileExpEntry.hashKey);
+
+    //Quick handling/exit if 'fileExpEntry' is for a new position
+    if (it != globalLearningHT.end())
+    {
+        //Key found. Now check if we have the move itself
+        std::vector<MoveInfo>::iterator existingMoveIterator = std::find_if(
+            it->second.siblingMoveInfo.begin(),
+            it->second.siblingMoveInfo.end(),
+            [&fileExpEntry](const MoveInfo& mi) {return mi.move == fileExpEntry.move; });
+
+        //If found, then return the score from hash table
+        if (existingMoveIterator != it->second.siblingMoveInfo.end())
+            return existingMoveIterator->score;
+    }
+
+    //Resort to the 'fileExpEntry' score
+    return fileExpEntry.score;
+}
+
+void writeLearningFile()
+{
+    /*
+      To avoid any problems when saving to experience file, we will actually do the following:
+      1) Save new experience to "experience_new.bin"
+      2) Remove "experience.bin"
+      3) Rename "experience_new.bin" to "experience.bin"
+
+      This approach is failproof so that the old file is only removed when the new file is sufccessfully saved!
+      If, for whatever odd reason, the engine is able to execute step (1) and (2) and fails to execute step (3)
+      i.e., we end up with experience0.bin then it is not a problem since the file will be loaded anyway the next
+      time the engine starts!
+    */
+    if (!globalLearningHT.empty())
+    {
+        std::ofstream outputFile(Utility::map_path("experience_new.bin"), std::ofstream::trunc | std::ofstream::binary);
+        for (auto& it : globalLearningHT)
+        {
+            LearningFileEntry currentFileExpEntry;
+            NodeInfo currentNodeInfo = it.second;
+            int siblingMoveInfoSize = currentNodeInfo.siblingMoveInfo.size();
+            for (int k = 0; k < siblingMoveInfoSize; k++)
+            {
+                MoveInfo currentLatestMoveInfo = currentNodeInfo.siblingMoveInfo[k];
+                currentFileExpEntry.depth = currentLatestMoveInfo.depth;
+                currentFileExpEntry.hashKey = it.first;
+                currentFileExpEntry.move = currentLatestMoveInfo.move;
+                currentFileExpEntry.score = currentLatestMoveInfo.score;
+                currentFileExpEntry.performance = currentLatestMoveInfo.performance;
+                outputFile.write((char*)&currentFileExpEntry, sizeof(currentFileExpEntry));
+            }
+        }
+        outputFile.close();
+
+        remove(Utility::map_path("experience.bin").c_str());
+        rename(Utility::map_path("experience_new.bin").c_str(), Utility::map_path("experience.bin").c_str());
+    }
+}
+//from Kelly End

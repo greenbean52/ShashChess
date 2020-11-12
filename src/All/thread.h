@@ -2,7 +2,7 @@
   ShashChess, a UCI chess playing engine derived from Stockfish
   Copyright (C) 2004-2008 Tord Romstad (Glaurung author)
   Copyright (C) 2008-2015 Marco Costalba, Joona Kiiski, Tord Romstad
-  Copyright (C) 2015-2018 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
+  Copyright (C) 2015-2019 Marco Costalba, Joona Kiiski, Gary Linscott, Tord Romstad
 
   ShashChess is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -42,8 +42,8 @@
 
 class Thread {
 
-  Mutex mutex;
-  ConditionVariable cv;
+  std::mutex mutex;
+  std::condition_variable cv;
   size_t idx;
   bool exit = false, searching = true; // Set before starting std::thread
   NativeThread stdThread;
@@ -52,37 +52,30 @@ public:
   explicit Thread(size_t);
   virtual ~Thread();
   virtual void search();
-  //from Shashin
-  virtual void updateShashinValues (Value score, int ct, Color us, Value value);
-  virtual void initShashinElements ();
-  //end from Shashin
   void clear();
-  virtual Value playout(Move, Search::Stack*, Value);//playout
   void idle_loop();
   void start_searching();
   void wait_for_search_finished();
 
   Pawns::Table pawnsTable;
   Material::Table materialTable;
-  Endgames endgames;
   size_t pvIdx, pvLast;
+  uint64_t ttHitAverage;
   int selDepth, nmpMinPly;
-  int64_t visits, allScores; //mcts Cardanobile from joergoster
   Color nmpColor;
-  std::atomic<uint64_t> nodes, tbHits;
+  std::atomic<uint64_t> nodes, tbHits, bestMoveChanges;
 
   Position rootPos;
+  StateInfo rootState;
   Search::RootMoves rootMoves;
   Depth rootDepth, completedDepth;
   CounterMoveHistory counterMoves;
   ButterflyHistory mainHistory;
+  LowPlyHistory lowPlyHistory;
   CapturePieceToHistory captureHistory;
-  ContinuationHistory continuationHistory;
-  Score contempt;
-  //from Shashin
-  uint8_t shashinValue;
-  int shashinContempt,shashinQuiescentCapablancaMaxScore,shashinMaxLmr;
-  //end from Shashin
+  ContinuationHistory continuationHistory[2][2];
+  bool fullSearch;//full threads patch
+  int shashinValue, shashinQuiescentCapablancaMiddleHighScore, shashinQuiescentCapablancaMaxScore;//shashinValue
  };
 
 
@@ -95,8 +88,9 @@ struct MainThread : public Thread {
   void search() override;
   void check_time();
 
-  double bestMoveChanges, previousTimeReduction;
-  Value previousScore;
+  double previousTimeReduction;
+  Value bestPreviousScore;
+  Value iterValue[4];
   int callsCnt;
   bool stopOnPonderhit;
   std::atomic_bool ponder;
@@ -112,12 +106,16 @@ struct ThreadPool : public std::vector<Thread*> {
   void start_thinking(Position&, StateListPtr&, const Search::LimitsType&, bool = false);
   void clear();
   void set(size_t);
+  void setFull(size_t);//full threads patch
 
   MainThread* main()        const { return static_cast<MainThread*>(front()); }
   uint64_t nodes_searched() const { return accumulate(&Thread::nodes); }
   uint64_t tb_hits()        const { return accumulate(&Thread::tbHits); }
+  Thread* get_best_thread() const;
+  void start_searching();
+  void wait_for_search_finished() const;
 
-  std::atomic_bool stop;
+  std::atomic_bool stop, increaseDepth;
 
 private:
   StateListPtr setupStates;
